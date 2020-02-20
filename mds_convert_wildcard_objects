@@ -1,0 +1,172 @@
+#!/bin/bash
+
+#Script used to find, backup and convert all wildcard object files on an R77 MDS server
+#in preparation for an R80 upgrade
+#
+#The GLOBAL and each DOMAIN have their own objects_5_0.C file that needs to be converted
+#to CSV, then updated prior to the database export process
+#
+#This script requires a python script from the following to perform the conversion:
+#https://github.com/chkp-wbelt/convert-wildcard
+#
+#v0.1 - 2020FEB19 - Initial
+#v0.2 - 2020FEB20 - Added MDS verification check
+
+# get CP environment
+. /etc/profile.d/CP.sh
+
+# check if script is running with root privileges
+if [ ${EUID} -ne 0 ];then
+  echo "Please run as admin"
+  exit 1
+fi
+
+# remove lock
+echo "Removing lock"
+clish -c 'lock database override' > /dev/null
+
+# Check is running on an MDS server, if not exit
+if [ -z ${MDSVERUTIL+x} ];
+then
+  echo "Script is specifically for an MDS environment, not a normal management server";
+  exit 1
+fi
+
+#Define misc variables
+GLOBAL_OBJECT_FILE=/var/opt/CPmds-R77/conf/objects_5_0.C
+WILDCARD_FILES_LISTING_NAME="wildcard_objects_listing.txt"
+CSV_PROCESSED_FILES_LISTING_NAME="csv_converted_listing.txt"
+TEMPDIR=/tmp/$HOSTNAME-wildcard_objects_conversion
+OUTPUTDIR=/tmp
+CONVERSION_SCRIPT=/home/admin/wildcard-object.py
+LOG_FILE_NAME="wildcard_conversion_log.txt"
+
+#Check to make sure python script exists to convert to CSV.
+#If not display message on where to download and get usage instructions
+if [ -f $CONVERSION_SCRIPT ]
+then
+    echo "Conversion script $CONVERSION_SCRIPT exists."
+else
+    echo "Error: Conversion script $TEMPDIR does not exist - exiting"
+    echo "Download and place script into /home/admin - get from https://github.com/chkp-wbelt/convert-wildcard/tree/master/R77-export"
+    echo "Make sure to follow all instructions on the page for permissions to execute script"
+    exit 1
+fi
+
+#Create temp directory to backup files into if doesn't exist. If exists, do nothing
+if [ -d $TEMPDIR ]
+then
+    echo "Directory $TEMPDIR exists."
+else
+    echo "Error: Directory $TEMPDIR does not exists - creating"
+    mkdir $TEMPDIR
+fi
+
+#Process the single global file, and loop through all Domains and process them one at a time
+function backup_and_convert_files() {
+
+  #Process the global file
+  G_DIR=$(dirname "${GLOBAL_OBJECT_FILE}")
+  G_DSTDIR="${TEMPDIR}/${G_DIR}"
+  #Check is Global Objects file exists, if so process
+  if [ -f $GLOBAL_OBJECT_FILE ]
+  then
+    backup_wilcard_object_files "$GLOBAL_OBJECT_FILE" "$G_DSTDIR"
+    csv_convert_wilcard_object_files "GLOBAL" "$GLOBAL_OBJECT_FILE" "$G_DSTDIR"
+  else
+      echo "Error: $GLOBAL_OBJECT_FILE does not exist" >> "${PWD}/${LOG_FILE_NAME}"
+  fi
+
+  #Process all domains using the ALLCMAs variable to loop through
+    for CMA_NAME in $($MDSVERUTIL AllCMAs)
+    do
+        CURRENT_FILE="/var/opt/CPmds-R77/customers/$CMA_NAME/CPsuite-R77/fw1/conf/objects_5_0.C"
+        #echo $CURRENT_FILE
+        DIR=$(dirname "${CURRENT_FILE}")
+        DSTDIR="${TEMPDIR}/${DIR}"
+        #Check if Domain level file exists, if so process
+        if [ -f $CURRENT_FILE ]
+        then
+          backup_wilcard_object_files "$CURRENT_FILE" "$DSTDIR"
+          csv_convert_wilcard_object_files "DOMAIN" "$CURRENT_FILE" "$DSTDIR" "$CMA_NAME"
+        else
+          echo "Error: $CURRENT_FILE does not exist" >> "${PWD}/${LOG_FILE_NAME}"
+          continue
+        fi
+    done
+echo "All wildcard object files backed up and listed in file ${PWD}/${WILDCARD_FILES_LISTING}"
+}
+
+#Make backup copies of all original files
+function backup_wilcard_object_files() {
+    #Append the current filenamee and path to a text file for rollback purposes, store it in the same directory the script is run from
+    echo $1 >> "${PWD}/${WILDCARD_FILES_LISTING_NAME}"
+    echo "-------------------"
+    echo "Backed Up File: $1"
+
+    #Backup the file while retaining the original folder structure
+    #Check if file exists, if so create a new directory within the TEMPDIR folder to store a copy of the file in
+    [ -f $1 ] && mkdir -p ${2} && mkdir -p ${2}/updated_object_file
+    #Check if the file exists, if so make a backup copy of the file
+    [ -f $1 ] && cp ${1} ${2}
+}
+
+#Create CSV output of all wildcard objects, store in
+function csv_convert_wilcard_object_files() {
+  #Use the first argument passed to determing if the GLOBAL file or a DOMAIN file, handle accordingly
+  case $1 in
+    GLOBAL )
+        #Put some info in a tracking file
+        echo "Global File" >> "${PWD}/${CSV_PROCESSED_FILES_LISTING_NAME}"
+        echo "Global Original File: $2" >> "${PWD}/${CSV_PROCESSED_FILES_LISTING_NAME}"
+        echo "Global Exported File: ${3}/$HOSTNAME-global_export.csv" >> "${PWD}/${CSV_PROCESSED_FILES_LISTING_NAME}"
+        #1. export wildcard objects from objects_5_0.C file to a csv file for use later on R80.20 management server
+        echo "Exporting ${2} to ${3}/$HOSTNAME-global_export.csv" >> "${PWD}/${LOG_FILE_NAME}"
+        $CONVERSION_SCRIPT export ${2} ${3}/$HOSTNAME-global_export.csv
+        #2. convert wildcard objects from objects_5_0.C file to have a netmask of 255.255.255.0 so migrate export/import will work properly
+        echo "Converting ${2} to ${3}/updated_object_file/objects_5_0.C" >> "${PWD}/${LOG_FILE_NAME}"
+        $CONVERSION_SCRIPT update ${2} ${3}/updated_object_file/objects_5_0.C
+        #3. chmod new objects_5_0.C file to have same permissions as original objects_5_0.C file
+        echo "Copying file permissions from ${2} to ${3}/updated_object_file/objects_5_0.C" >> "${PWD}/${LOG_FILE_NAME}"
+        chmod --reference=${2} ${3}/updated_object_file/objects_5_0.C
+        #4. move the original objects_5_0.C file to .original
+        echo "Making a backup of ${2} to ${2}.original" >> "${PWD}/${LOG_FILE_NAME}"
+        mv ${2} ${2}.original
+        #5. move upgraded objects_5_0.C file to be active objects file
+        echo "Replacing ${2} with ${3}/updated_object_file/objects_5_0.C" >> "${PWD}/${LOG_FILE_NAME}"
+        mv ${3}/updated_object_file/objects_5_0.C ${2}
+      ;;
+    DOMAIN )
+        #Put some info in a tracking file
+        echo "Domain: $4" >> "${PWD}/${CSV_PROCESSED_FILES_LISTING_NAME}"
+        echo "$4 Original File: $2" >> "${PWD}/${CSV_PROCESSED_FILES_LISTING_NAME}"
+        echo "$4 Exported File: ${3}/$4_export.csv" >> "${PWD}/${CSV_PROCESSED_FILES_LISTING_NAME}"
+        #1. export wildcard objects from objects_5_0.C file to a csv file for use later on R80.20 management server
+        echo "Exporting ${2} to ${3}/$HOSTNAME-global_export.csv" >> "${PWD}/${LOG_FILE_NAME}"
+        $CONVERSION_SCRIPT export ${2} ${3}/$4_export.csv
+        #2. convert wildcard objects from objects_5_0.C file to have a netmask of 255.255.255.0 so migrate export/import will work properly
+        echo "Converting ${2} to ${3}/updated_object_file/objects_5_0.C" >> "${PWD}/${LOG_FILE_NAME}"
+        $CONVERSION_SCRIPT update ${2} ${3}/updated_object_file/objects_5_0.C
+
+        #After running the python convert script, some domains may NOT have any wildcard objects and there won't be an output file
+        #so we check to make sure one exists before processing, otherwise we capture a proper error message
+        if [ -f ${3}/updated_object_file/objects_5_0.C ]
+        then
+          #3. chmod new objects_5_0.C file to have same permissions as original objects_5_0.C file
+          echo "Copying file permissions from ${2} to ${3}/updated_object_file/objects_5_0.C" >> "${PWD}/${LOG_FILE_NAME}"
+          chmod --reference=${2} ${3}/updated_object_file/objects_5_0.C
+          #4. move the original objects_5_0.C file to .original
+          echo "Making a backup of ${2} to ${2}.original" >> "${PWD}/${LOG_FILE_NAME}"
+          mv ${2} ${2}.original
+          #5. move upgraded objects_5_0.C file to be active objects file
+          echo "Replacing ${2} with ${3}/updated_object_file/objects_5_0.C" >> "${PWD}/${LOG_FILE_NAME}"
+          mv ${3}/updated_object_file/objects_5_0.C ${2}
+        else
+            echo "Error: ${3}/updated_object_file/objects_5_0.C does not exist" >> "${PWD}/${LOG_FILE_NAME}"
+        fi
+      ;;
+  esac
+}
+
+#Execute the backup and conversion process
+backup_and_convert_files
